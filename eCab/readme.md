@@ -25,11 +25,72 @@ This document describes the architecture of an **embedded chatbot SDK** that ena
 
 
 ## Architecture
-### Authentication
-Users log in to E-Cabinet as usual. The embedded BO SDK sends a user token (Bearer) and userId to BO backend during initialisation. BO backend validates the token against E-Cabinet's IdP (Identity Provider). Once authenticated, users can use meeting features (including in-meeting chat).
 
-### Meeting Features
-E-Cabinet handles user operations (e.g., logins, create meeting, document upload) updates its own backend, and replicates necessary data to BO's backend. Documents uploaded to E-Cabinet are stored locally and pushed to BO (via API or queue) for indexing into a vector DB. This ensures BO has access to documents for RAG in the embedded chatbot.
+The architecture comprises the following major components:
+
+* **BO SDK (in E-Cabinet Frontend)**
+  Embedded JavaScript (jQuery-based) that runs in the browser context of E-Cabinet. It handles token fetch, WebSocket connection, voice capture/playback, REST API wrappers.
+
+* **E-Cabinet Backend (ASP.NET)**
+  The host application backend provides user login, session management (via OIDC), and a token endpoint for issuing short-lived tokens for BO. It also replicates document uploads, metadata, and meeting-related requests to BO Backend using REST API calls or Message Queues.
+
+* **E-Cabinet Identity Provider (IdP)**
+  A centralized IdP that issues ID Tokens / access tokens that are trusted by both E-Cabinet and BO. Details TBD.
+
+* **BO Backend (Node/Python + Socket.io)**
+  The core meeting and chat engine. It validates tokens, processes WebSocket chat messages, interacts with REST APIs for meetings, files, insights, action items, etc.
+
+* **WebSocket Gateway (socket.io)**
+  A real-time channel for chat messages, heartbeat, “join_room” and other meeting events. It receives the initial handshake (`40{token, userId}`), validates, then routes events to chat services.
+
+* **Document Services**
+  This service receives document upload events, fetches blob data, chunks, generates embeddings, and indexes them into a **Vector DB** under tenant-scoped namespaces.
+
+* **Vector DB + Retriever**
+  A vector store (Weaviate) that holds document embeddings and supports similarity search queries for RAG.
+
+* **Embedding Service**
+  An internal service (on-prem) that transforms text (document chunks) into embeddings, for use by the Document Ingestor or incremental updates.
+
+* **LLM Inference Cluster**
+  The Arabic language model (JAIS) serving layer that receives prompts (user + retrieved context) and returns generated answers (possibly streaming).
+
+* **Azure Speech Recognition Engine**
+  The speech pipeline, housed on-prem.
+  * STT: converts audio chunks/streams into text.
+  * TTS: converts generated text responses into audio to play back to the user.
+
+* **Storage & Data Stores**
+  * File / object store for meeting attachments, transcripts, audio buffers, models.
+  * Multi-tenant document DB for meeting/metadata/account state.
+  * Cache (Redis) for ephemeral state, session info.
+  * Logging and metrics (EFK, Prometheus)
+
+* **CI/CD, Secrets & Infra**
+  Tools for deployment, secret management, cluster orchestration, backups, monitoring integration, etc.
+
+### Authentication
+Users log in to E-Cabinet as usual. The embedded BO SDK sends a user token (Bearer) and userId to BO backend during initialization. BO backend validates the token against E-Cabinet's IdP (Identity Provider). Once authenticated, users can use meeting features (including in-meeting chat).
+  * E-Cabinet and BO are configured as **relying parties** (clients) in the Identity Provider (IdP). When a user logs into E-Cabinet, the IdP issues an **ID Token** (JWT) that includes standard claims.
+  * The SDK in the browser gets a token after verifying session.
+  * SDK opens a Socket.IO connection to BO’s `wsUrl`.
+  * The platform responds with the initial handshake.
+  * The SDK sends the initial handshake frame as 40{"token": "<id_token>", "userId": "<sub>"} via Socket.IO.
+  * BO validates the token. On success, it sends back success and opens the chat session.
+  * If the token expires, the SDK may refresh (via the token endpoint).
+
+### Document Sync and Query Handling
+  * Whenever E-Cabinet uploads a document, the E-Cabinet backend publishes a document ingest event to the Message Queue, including metadata like tenant_id, meeting_id, and blob URL.
+  * The **Document Listener** fetches the blob from E-Cabinet’s object store, chunks it, and sends chunks to the Embedding Service.
+  * Embedding results are upserted into the **Vector DB**, scoped by `tenant_id`.
+  * When indexing is complete, BO marks documents as ready for RAG retrieval.
+  * On chat message receipt, BO calls:
+    1. `vectorDB.search(queryEmbedding, topK)`
+    2. Retrieve relevant contexts
+    3. Build prompt: user query + retrieved contexts + system instructions
+    4. Send to LLM
+    5. Return LLM output as chatbot reply
+  * For voice input paths, the same flow is used after STT and transcript.
 
 ### Chatbot Feature
 An embeddable SDK for E-Cabinet's web app, that provides AI-powered chatbot features only (no full BO product integration). It supports:
@@ -45,6 +106,31 @@ Chat interactions occur over secure WebSocket (socket.io). Sample exchange inclu
   * Ping/pong for keep-alive.
   * Messages include metadata like meetingType:"in-meeting".
 BO backend provides RAG-based LLM responses using previously replicated documents.
+
+### Meeting Features
+E-Cabinet handles user operations (e.g., logins, create meeting, document upload) updates its own backend, and replicates necessary data to BO's backend. Documents uploaded to E-Cabinet are stored locally and pushed to BO (via API or queue) for indexing into a vector DB. This ensures BO has access to documents for RAG in the embedded chatbot.
+
+#### Pre-Meeting
+  * **Create / Update Drafts**: The SDK calls `POST /meeting-drafts` or `PATCH /meetings/{id}` to establish meeting metadata (title, agenda, participants).
+  * **Upload Documents**: Files uploaded from E-Cabinet via the SDK are sent to BO with `POST /files/upload/azure` (multipart/form-data) and stored in object store.
+  * **Insights / Agenda Suggestions**: SDK may invoke `GET /meetings/{meetingId}/get-insights` to retrieve AI-generated agenda items or summaries.
+
+### In-Meeting (Live chat & voice)
+  * **Start the Meeting**: Using `PATCH /meetings/{meetingId}` or equivalent to mark meeting status “started.”
+  * **Chat (Text)**: SDK emits chat messages via WebSocket events (`"chat_message"` or `"42[...]` frames) to BO, which persists and broadcasts.
+  * **Voice → Text**: SDK captures microphone audio, streams or posts to STT engine → receives transcript → sends as chat message.
+  * **Bot Response + RAG**: BO receives message, queries the Vector DB for relevant document context, constructs prompt, calls LLM, and returns the answer (via WebSocket).
+  * **Text → Voice**: If configured, BO sends chatbot replies over TTS endpoint; SDK receives audio, decodes, and plays back.
+  * **Action Items**: SDK uses `POST /action-items` to create tasks mid-meeting; or poll via `GET /action-items/meeting/{meetingId}`.
+
+### Post-Meeting
+  * **Summaries**: E-Cabinet calls `POST /internal/meetings/summary` (or similar) to persist meeting summary.
+  * **Retrieve Meeting Metadata**: `GET /meetings/{meetingId}` returns full meeting record including summary.
+  * **Action Items**: `GET /action-items/meeting/{meetingId}` to list them; `PUT /action-items/status` to update statuses.
+  * **Download Files**: `POST /files/download/azure` to get meeting attachments (blobs or presigned URLs).
+
+Note: All calls include Authorization: Bearer <token> and tenant_id in headers/body.
+
 
 ### Overall Architecture
 
@@ -244,6 +330,8 @@ sequenceDiagram
   BO-->>E-Cabinet: Status updated
 
 ```
+---
+## Multi-Tenancy & Environment Isolation
 
 
 ---
@@ -262,7 +350,7 @@ sequenceDiagram
 <TBD>
 
 ---
-## Networking, Security & Tenancy
+## Networking and Security
 <TBD>
 
 ---
